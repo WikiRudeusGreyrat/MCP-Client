@@ -8,6 +8,7 @@ import { createInterface } from "readline";
 import { homedir } from 'os';
 import dotenv from "dotenv";
 import config, { ServerConfig } from "./server-config.js";
+
 // 加载 .env 文件中的环境变量
 dotenv.config();
 
@@ -33,11 +34,18 @@ class MCPClient {
     private sessions: Map<string, Client> = new Map();
     private transports: Map<string, StdioClientTransport | SSEClientTransport> = new Map();
     private openai: OpenAI;
+    private messageHistory: ChatCompletionMessageParam[] = [];
     
     constructor() {
         this.openai = new OpenAI({
             apiKey: LLM_API_KEY,
             baseURL: LLM_BASE_URL
+        });
+        
+        // 添加系统消息作为历史记录的第一条消息
+        this.messageHistory.push({
+            role: "system",
+            content: "你是一个AI助手，可以帮助用户访问各种数据库和工具。请尽可能地记住我们的对话内容，并在回答问题时考虑到之前的对话历史。"
         });
     }
     
@@ -114,12 +122,11 @@ class MCPClient {
             throw new Error("Not connected to any server");
         }
         
-        const messages: ChatCompletionMessageParam[] = [
-            {
-                role: "user",
-                content: query
-            }
-        ];
+        // 添加用户新的查询到历史
+        this.messageHistory.push({
+            role: "user",
+            content: query
+        });
         
         // 获取所有服务器的工具列表
         const availableTools: any[] = [];
@@ -145,7 +152,7 @@ class MCPClient {
         // 调用OpenAI API - 使用断言确保模型名称不为undefined
         const completion = await this.openai.chat.completions.create({
             model: LLM_MODEL as string,
-            messages,
+            messages: this.messageHistory,
             tools: availableTools,
             tool_choice: "auto"
         });
@@ -158,9 +165,22 @@ class MCPClient {
             
             if (message.content) {
                 finalText.push(message.content);
+                
+                // 添加助手的回复到历史
+                this.messageHistory.push({
+                    role: "assistant",
+                    content: message.content
+                });
             }
             
             if (message.tool_calls && message.tool_calls.length > 0) {
+                // 添加带工具调用的助手消息到历史
+                this.messageHistory.push({
+                    role: "assistant",
+                    content: "",
+                    tool_calls: message.tool_calls
+                });
+                
                 for (const toolCall of message.tool_calls) {
                     try {
                         const [serverName, toolName] = toolCall.function.name.split('__');
@@ -188,14 +208,8 @@ class MCPClient {
                         console.log(toolResultContent);
                         finalText.push(toolResultContent);
                         
-                        // 继续与工具结果的对话
-                        messages.push({
-                            role: "assistant",
-                            content: "",
-                            tool_calls: [toolCall]
-                        });
-                        
-                        messages.push({
+                        // 添加工具结果到历史
+                        this.messageHistory.push({
                             role: "tool",
                             tool_call_id: toolCall.id,
                             content: toolResultContent
@@ -204,13 +218,19 @@ class MCPClient {
                         // 获取下一个响应 - 使用断言确保模型名称不为undefined
                         const nextCompletion = await this.openai.chat.completions.create({
                             model: LLM_MODEL as string,
-                            messages,
+                            messages: this.messageHistory,
                             tools: availableTools,
                             tool_choice: "auto"
                         });
                         
                         if (nextCompletion.choices[0].message.content) {
                             finalText.push(nextCompletion.choices[0].message.content);
+                            
+                            // 添加最终响应到历史
+                            this.messageHistory.push({
+                                role: "assistant",
+                                content: nextCompletion.choices[0].message.content
+                            });
                         }
                     } catch (error: any) {  // 使用 any 类型，以便能够访问 message 属性
                         console.error("Error during tool call processing:", error);
@@ -223,9 +243,18 @@ class MCPClient {
         return finalText.join("\n");
     }
     
+    // 清除对话历史
+    clearHistory(): void {
+        this.messageHistory = [{
+            role: "system",
+            content: "你是一个AI助手，可以帮助用户访问各种数据库和工具。请尽可能地记住我们的对话内容，并在回答问题时考虑到之前的对话历史。"
+        }];
+        console.log("\n对话历史已清除");
+    }
+    
     async chatLoop(): Promise<void> {
         console.log("\nMCP Client Started!");
-        console.log("Type your queries or 'quit' to exit.");
+        console.log("Type your queries or 'quit' to exit. Type 'clear' to clear conversation history.");
         
         const readline = createInterface({
             input: process.stdin,
@@ -243,6 +272,11 @@ class MCPClient {
                 const query = (await askQuestion()).trim();
                 if (query.toLowerCase() === 'quit') {
                     break;
+                }
+                
+                if (query.toLowerCase() === 'clear') {
+                    this.clearHistory();
+                    continue;
                 }
                 
                 if (!query) {
